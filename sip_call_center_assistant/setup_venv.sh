@@ -8,11 +8,11 @@ VENV_DIR="venv"
 if [ -d "$VENV_DIR" ]; then
   echo "Virtual environment '$VENV_DIR' already exists."
 else
-  echo "Creating virtual environment '$VENV_DIR'..."
-  # Use python3 explicitly for better compatibility on macOS/Linux
-  python3 -m venv "$VENV_DIR"
+  echo "Creating virtual environment '$VENV_DIR' using python3.11..."
+  # Use python3.11 explicitly
+  python3.11 -m venv "$VENV_DIR"
   if [ $? -eq 0 ]; then
-    echo "Virtual environment created successfully."
+    echo "Virtual environment created successfully using python3.11."
     echo "Activate it using: source $VENV_DIR/bin/activate"
   else
     echo "Error: Failed to create virtual environment."

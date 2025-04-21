@@ -147,9 +147,11 @@ CONFIG = {
 
 
 class AudioLoop:
-    def __init__(self):
-        self.audio_in_queue = None # Queue for incoming audio FROM Gemini (to be sent to Twilio by app.py)
-        self.out_queue = None # Queue for outgoing audio/text TO Gemini (received from Twilio via app.py)
+    # Added transcript_queue to init parameters
+    def __init__(self, audio_in_queue: asyncio.Queue, out_queue: asyncio.Queue, transcript_queue: asyncio.Queue):
+        self.audio_in_queue = audio_in_queue # Queue for incoming audio FROM Gemini (to be sent to Twilio by app.py)
+        self.out_queue = out_queue # Queue for outgoing audio/text TO Gemini (received from Twilio via app.py)
+        self.transcript_queue = transcript_queue # Queue for sending transcript text back to app.py
         self.text_in_queue = asyncio.Queue() # Queue for incoming text messages (e.g., from future API endpoint if needed)
         self.shutdown_event = asyncio.Event() # Event to signal shutdown
         self.session = None
@@ -218,8 +220,9 @@ class AudioLoop:
                         # Put received audio data into the queue for app.py to pick up
                         self.audio_in_queue.put_nowait(data)
                     if text := response.text:
-                        # Log received text (app.py doesn't directly handle this text)
-                        print(f"Received text from Gemini: {text}", end="")
+                        # Put received text into the transcript queue for app.py
+                        # print(f"Received text from Gemini: {text}", end="") # Optional: Keep logging if desired
+                        self.transcript_queue.put_nowait(text) # Send text back to app.py
 
                     # --- Handle Tool Calls ---
                     if tool_call := response.tool_call:
@@ -289,20 +292,21 @@ class AudioLoop:
             self.loop = asyncio.get_running_loop()
             print(f"AudioLoop running on event loop: {self.loop}")
 
+            print("Attempting to connect to Gemini Live API...") # Added log
             async with client.aio.live.connect(model=MODEL, config=CONFIG) as session:
                 self.session = session
-                print("Gemini Live session connected.")
+                print("Gemini Live session connected.") # Existing log
 
                 # Queues are now created and managed by app.py, but we need references
                 # For simplicity, let's assume they are created before run() is called
                 # and potentially passed in or set externally.
-                # If run() is called immediately after __init__, they need creation here.
-                # Let's create them here for now, assuming app.py will use these instances.
-                # NOTE: This might need refinement based on how app.py instantiates AudioLoop.
-                # If app.py creates the queues, it should set them on the instance.
-                # For now, let's create them here to ensure they exist.
-                self.audio_in_queue = asyncio.Queue() # Audio FROM Gemini
-                self.out_queue = asyncio.Queue(maxsize=20) # Audio TO Gemini
+                # Queues (audio_in_queue, out_queue, transcript_queue) are now expected
+                # to be passed in during initialization by app.py.
+                # No need to create them here anymore.
+                if not all([self.audio_in_queue, self.out_queue, self.transcript_queue]):
+                     print("Error: AudioLoop queues not initialized before run().")
+                     # Consider raising an exception or handling this error appropriately
+                     return # Stop execution if queues are missing
 
                 async with asyncio.TaskGroup() as tg:
                     print("Starting Gemini background tasks...")
@@ -316,15 +320,18 @@ class AudioLoop:
                     await self.shutdown_event.wait()
                     print("Shutdown signal received by Gemini loop. Cancelling tasks...")
 
+            print("Exited Gemini Live API connection block.") # Added log
+
         except asyncio.CancelledError:
             print("Gemini run loop cancelled externally.")
         except ExceptionGroup as eg:
             print("Exception Group caught in Gemini run:")
             for i, exc in enumerate(eg.exceptions):
                  print(f"  Exception {i+1}/{len(eg.exceptions)}: {type(exc).__name__}: {exc}")
+                 traceback.print_exc() # Added traceback here
         except Exception as e:
             print(f"Unexpected error in Gemini run: {type(e).__name__}: {e}")
-            traceback.print_exc()
+            traceback.print_exc() # Ensure traceback is printed here too
         finally:
             print("Gemini run loop finished. Cleaning up...")
             self.shutdown_event.set() # Ensure it's set

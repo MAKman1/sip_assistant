@@ -1,5 +1,7 @@
 Flask
-flask-sock
+Flask-SocketIO
+Flask-CORS
+flask-sock # Keep for Twilio media stream for now, might refactor later
 google-genai
 python-dotenv
 twilio
