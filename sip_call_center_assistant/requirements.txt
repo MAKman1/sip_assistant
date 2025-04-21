@@ -1,0 +1,11 @@
+Flask
+flask-sock
+google-genai
+python-dotenv
+twilio
+# opencv-python # Removed - No longer needed for video
+pyaudio
+# Pillow # Removed - No longer needed for video/image processing
+# mss # Removed - No longer needed for screen capture
+taskgroup; python_version < "3.11"
+exceptiongroup; python_version < "3.11"
