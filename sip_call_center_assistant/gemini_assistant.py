@@ -22,6 +22,7 @@ import io
 import os
 import sys
 import traceback
+import queue # Added for thread-safe queue
 
 # import pyaudio # Removed - Audio handled by app.py via WebSocket
 from google import genai
@@ -166,9 +167,23 @@ class AudioLoop:
                 text = await asyncio.wait_for(self.text_in_queue.get(), timeout=0.5)
                 if text is None:
                     break
-                if self.session:
-                    print(f"Sending text to Gemini: {text}") # Log sending
-                    await self.session.send(input=text or ".", end_of_turn=True)
+                # Check session before sending
+                if self.session is not None:
+                    try:
+                        print(f"Sending text to Gemini: {text}") # Log sending
+                        await self.session.send(input=text or ".", end_of_turn=True)
+                    except (TypeError, AttributeError) as e:
+                        print(f"Send Text: Session became invalid during send: {e}")
+                        self.shutdown_event.set() # Signal shutdown
+                        break
+                    except Exception as e:
+                        print(f"Send Text: Unexpected error during send: {e}")
+                        self.shutdown_event.set() # Signal shutdown
+                        break
+                else:
+                    print("Send Text: Session is None, stopping.")
+                    self.shutdown_event.set() # Signal shutdown
+                    break
                 self.text_in_queue.task_done()
             except asyncio.TimeoutError:
                 continue
@@ -185,9 +200,24 @@ class AudioLoop:
             try:
                 # Wait for an item (audio chunk from Twilio via app.py)
                 msg = await asyncio.wait_for(self.out_queue.get(), timeout=0.5)
-                if self.session:
-                    # msg should be {"data": pcm16_data, "mime_type": "audio/pcm"} as prepared in app.py
-                    await self.session.send(input=msg)
+
+                # Check session before sending
+                if self.session is not None:
+                    try:
+                        # msg should be {"data": pcm16_data, "mime_type": "audio/pcm"} as prepared in app.py
+                        await self.session.send(input=msg)
+                    except (TypeError, AttributeError) as e:
+                        print(f"Send Realtime: Session became invalid during send: {e}")
+                        self.shutdown_event.set() # Signal shutdown
+                        break
+                    except Exception as e:
+                        print(f"Send Realtime: Unexpected error during send: {e}")
+                        self.shutdown_event.set() # Signal shutdown
+                        break
+                else:
+                     print("Send Realtime: Session is None, stopping.")
+                     self.shutdown_event.set() # Signal shutdown
+                     break
                 self.out_queue.task_done()
             except asyncio.TimeoutError:
                 continue
@@ -212,25 +242,47 @@ class AudioLoop:
                     await asyncio.sleep(0.1)
                     continue
 
-                turn = self.session.receive()
-                async for response in turn:
-                    if self.shutdown_event.is_set():
-                        break
-                    if data := response.data:
-                        # Put received audio data into the queue for app.py to pick up
-                        self.audio_in_queue.put_nowait(data)
-                    if text := response.text:
-                        # Put received text into the transcript queue for app.py
-                        # print(f"Received text from Gemini: {text}", end="") # Optional: Keep logging if desired
-                        self.transcript_queue.put_nowait(text) # Send text back to app.py
+                # Check session before receiving
+                if self.session is None:
+                    print("Receive Audio: Session is None, stopping.")
+                    self.shutdown_event.set()
+                    break
 
-                    # --- Handle Tool Calls ---
-                    if tool_call := response.tool_call:
-                         await self.handle_tool_call(tool_call)
+                try:
+                    turn = self.session.receive()
+                    async for response in turn:
+                        if self.shutdown_event.is_set():
+                            break
+                        if data := response.data:
+                            # Put received audio data into the queue for app.py to pick up
+                            print(f"Gemini Receiver: Received audio chunk (size: {len(data)} bytes)") # Log audio received
+                            self.audio_in_queue.put_nowait(data)
+                        if text := response.text:
+                            # Put received text into the transcript queue for app.py
+                            # print(f"Received text from Gemini: {text}", end="") # Optional: Keep logging if desired
+                            self.transcript_queue.put_nowait(text) # Send text back to app.py
 
-                # Clear queue on interrupt (if applicable)
-                while not self.audio_in_queue.empty():
-                    self.audio_in_queue.get_nowait()
+                        # --- Handle Tool Calls ---
+                        if tool_call := response.tool_call:
+                             await self.handle_tool_call(tool_call)
+
+                    # Clear queue on interrupt (if applicable) - Moved inside try
+                    while not self.audio_in_queue.empty():
+                        self.audio_in_queue.get_nowait()
+
+                except (TypeError, AttributeError) as e:
+                    print(f"Receive Audio: Session became invalid during receive: {e}")
+                    self.shutdown_event.set()
+                    break
+                except asyncio.CancelledError:
+                    # This specific exception should be handled by the outer block
+                    raise
+                except Exception as e:
+                    # Catch other errors during receive/iteration
+                    print(f"Receive Audio: Error during receive/iteration: {e}")
+                    traceback.print_exc()
+                    self.shutdown_event.set()
+                    break
 
             except asyncio.CancelledError:
                 print("Receive audio task cancelled.")
@@ -266,10 +318,22 @@ class AudioLoop:
                     response={'error': f'Function {fc.name} not implemented'},
                 ))
 
-        if function_responses and self.session:
-            tool_response = types.LiveClientToolResponse(function_responses=function_responses)
-            print(f"Sending tool response to Gemini: {tool_response}")
-            await self.session.send(input=tool_response)
+        if function_responses:
+            # Check session before sending tool response
+            if self.session is not None:
+                try:
+                    tool_response = types.LiveClientToolResponse(function_responses=function_responses)
+                    print(f"Sending tool response to Gemini: {tool_response}")
+                    await self.session.send(input=tool_response)
+                except (TypeError, AttributeError) as e:
+                    print(f"Handle Tool Call: Session became invalid during send: {e}")
+                    self.shutdown_event.set() # Signal shutdown
+                except Exception as e:
+                    print(f"Handle Tool Call: Unexpected error during send: {e}")
+                    self.shutdown_event.set() # Signal shutdown
+            else:
+                print("Handle Tool Call: Session is None, cannot send tool response.")
+                self.shutdown_event.set() # Signal shutdown
 
 
     # async def play_audio(self): # Removed - Audio output sent via audio_in_queue to app.py

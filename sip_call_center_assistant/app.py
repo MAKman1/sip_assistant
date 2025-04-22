@@ -7,6 +7,8 @@ import json
 import audioop # For audio format conversion
 import traceback # Added for better error logging in WebSocket
 import sys # Added for version check
+import queue # For thread-safe queue between Flask and Asyncio threads
+import time # For sleep
 
 # Conditional import for ExceptionGroup backport
 if sys.version_info < (3, 11, 0):
@@ -32,9 +34,25 @@ from flask_cors import CORS # Added for Frontend communication
 from dotenv import load_dotenv
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream # For TwiML generation
 from twilio.rest import Client as TwilioRestClient # Added for outbound calls
-from websockets.exceptions import ConnectionClosedOK # Correct exception for websockets library used by flask-sock
+# flask-sock uses different underlying libraries, need robust exception handling
+# from websockets.exceptions import ConnectionClosedOK # May not be the right one
+# Instead, catch generic Exception or specific ones from the underlying ws library if known (e.g., geventwebsocket.exceptions.WebSocketError)
 
 from gemini_assistant import AudioLoop # Keep this import
+# Attempt to import potential underlying websocket exceptions for flask-sock
+try:
+    from geventwebsocket.exceptions import WebSocketError
+except ImportError:
+    WebSocketError = ConnectionError # Fallback to a general connection error
+
+try:
+    # Simple-websocket might be used too
+    from simple_websocket import ConnectionClosed
+except ImportError:
+    ConnectionClosed = ConnectionError # Fallback
+
+# Define a tuple of likely connection closed exceptions
+CONNECTION_CLOSED_EXCEPTIONS = (WebSocketError, ConnectionClosed, ConnectionError)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -157,36 +175,73 @@ def sip_stream(ws):
     assistant_instance = None
     audio_tasks = []
     # Create queues for this specific connection
-    audio_in_queue = asyncio.Queue() # Audio FROM Gemini TO Twilio
-    out_queue = asyncio.Queue(maxsize=20) # Audio FROM Twilio TO Gemini
-    transcript_queue = asyncio.Queue() # Transcript text FROM Gemini TO Frontend
+    audio_in_queue = asyncio.Queue()      # Audio FROM Gemini TO Async Sender Task
+    out_queue = asyncio.Queue(maxsize=20)   # Audio FROM Sync Receiver TO Gemini
+    transcript_queue = asyncio.Queue()    # Transcript text FROM Gemini TO Async Transcript Sender
+    twilio_send_queue = queue.Queue()     # Messages FROM Async Sender Task TO Sync Sender (Flask Thread)
+    connection_active = threading.Event() # Use threading.Event for cross-thread signaling
+    connection_active.set()               # Initially assume connection is active
 
-    async def run_assistant_tasks(loop_instance: AudioLoop):
-        """Runs the necessary assistant tasks in the background."""
+    # --- Async Tasks (Managed by Background Thread's Event Loop) ---
+
+    async def run_async_tasks(loop_instance: AudioLoop, twilio_send_q: queue.Queue, conn_active_flag: threading.Event):
+        """Runs the Gemini audio sender and main assistant loop tasks."""
+        send_task = None
+        run_task = None
+        tasks = set()
         try:
             async with asyncio.TaskGroup() as tg:
-                # Task to send audio from Gemini to Twilio
-                audio_tasks.append(tg.create_task(send_gemini_audio_to_twilio(loop_instance, ws), name="gemini_to_twilio"))
-                # Task to run the core Gemini processing loop (Corrected: only one instance)
-                audio_tasks.append(tg.create_task(loop_instance.run(), name="gemini_run_loop"))
-                print("Assistant background tasks started.")
-                # No need to wait here, run() will block until stopped
-        except ExceptionGroup as eg: # Use ExceptionGroup for backport compatibility
-            print(f"--- ERROR in run_assistant_tasks TaskGroup ---")
-            # Print full traceback for detailed debugging
-            for i, exc in enumerate(eg.exceptions):
-                 print(f"  TaskGroup Exception {i+1}/{len(eg.exceptions)}: {type(exc).__name__}: {exc}")
-                 traceback.print_exception(type(exc), exc, exc.__traceback__)
-            print(f"--- END ERROR in run_assistant_tasks TaskGroup ---")
-            # Re-raise the exception group if necessary, or handle cleanup
-            # raise # Optional: re-raise if Flask/SocketIO should handle it further
+                print("Starting assistant async TaskGroup...")
+                # Task to get audio from Gemini and put message onto the thread-safe queue
+                send_task = tg.create_task(send_gemini_audio_to_sync_queue(loop_instance, twilio_send_q, conn_active_flag), name="gemini_to_sync_queue")
+                tasks.add(send_task)
+                # Task to run the core Gemini processing loop
+                run_task = tg.create_task(loop_instance.run(), name="gemini_run_loop")
+                tasks.add(run_task)
+                # Transcript sender task will be started by the main thread via run_coroutine_threadsafe
+                print("Assistant async background tasks created.")
+            print("Assistant async TaskGroup finished.")
 
-    async def send_gemini_audio_to_twilio(loop_instance: AudioLoop, websocket):
-        """Gets audio from Gemini's output queue, converts it, and sends to Twilio."""
-        while True:
+        except ExceptionGroup as eg: # Use ExceptionGroup for backport compatibility
+            print(f"--- ERROR in run_async_tasks TaskGroup ---")
+            for i, exc in enumerate(eg.exceptions):
+                print(f"  Async TaskGroup Exception {i+1}/{len(eg.exceptions)}: {type(exc).__name__}: {exc}")
+                if not isinstance(exc, (asyncio.CancelledError)): # Don't trace expected cancellations
+                     traceback.print_exception(type(exc), exc, exc.__traceback__)
+            print(f"--- END ERROR in run_async_tasks TaskGroup ---")
+            conn_active_flag.clear() # Signal main thread to stop
+        except asyncio.CancelledError:
+             print("run_async_tasks was cancelled.")
+             conn_active_flag.clear()
+        except Exception as e:
+             print(f"Unexpected error in run_async_tasks: {type(e).__name__}: {e}")
+             traceback.print_exc()
+             conn_active_flag.clear()
+        finally:
+            print("Cleaning up async tasks...")
+            conn_active_flag.clear() # Ensure flag is cleared
+            print("Async task cleanup finished.")
+
+
+    async def send_gemini_audio_to_sync_queue(loop_instance: AudioLoop, twilio_send_q: queue.Queue, conn_active_flag: threading.Event):
+        """Gets audio from Gemini's output queue, converts it, and puts JSON message onto thread-safe queue."""
+        while conn_active_flag.is_set(): # Check flag managed by main thread
             try:
-                # Get audio data from Gemini's output queue (likely 24kHz PCM16)
-                gemini_pcm24_chunk = await asyncio.wait_for(loop_instance.audio_in_queue.get(), timeout=0.1)
+                # Check flag before waiting
+                if not conn_active_flag.is_set():
+                    print("Async Sender: Connection inactive flag set, exiting.")
+                    break
+
+                # Get audio data from Gemini's output queue
+                try:
+                    gemini_pcm24_chunk = await asyncio.wait_for(loop_instance.audio_in_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue # No audio, loop and check flag again
+
+                # Check flag again after waiting
+                if not conn_active_flag.is_set():
+                    print("Async Sender: Connection inactive flag set after wait, exiting.")
+                    break
 
                 # 1. Convert 24kHz PCM16 -> 8kHz PCM16
                 gemini_pcm8_chunk = change_rate(gemini_pcm24_chunk, GEMINI_OUTPUT_SAMPLE_RATE, TWILIO_SAMPLE_RATE)
@@ -198,249 +253,250 @@ def sip_stream(ws):
                 twilio_payload = base64.b64encode(twilio_ulaw_chunk).decode('utf-8')
                 media_message = {
                     "event": "media",
-                    "streamSid": "placeholder_stream_sid", # Ideally get this from the 'start' event
+                    "streamSid": "placeholder_stream_sid", # TODO: Get real streamSid if possible
                     "media": {
                         "payload": twilio_payload
                     }
                 }
-                await websocket.send(json.dumps(media_message))
-                loop_instance.audio_in_queue.task_done()
 
-            except asyncio.TimeoutError:
-                # No audio from Gemini, just continue waiting.
-                # If the websocket is actually closed, the next send() will fail.
-                continue
-            except ConnectionClosedOK:
-                print("WebSocket closed by Twilio while sending audio. Stopping sender.")
-                break
+                # 4. Put the JSON string onto the thread-safe queue for the main thread to send
+                try:
+                    twilio_send_q.put(json.dumps(media_message))
+                    loop_instance.audio_in_queue.task_done()
+                except queue.Full:
+                    print("Warning: Twilio send queue is full. Discarding audio chunk.")
+                    loop_instance.audio_in_queue.task_done() # Mark as done even if discarded
+
             except asyncio.CancelledError:
-                print("Send Gemini audio task cancelled.")
+                print("Async Sender: Task cancelled.")
+                break # Exit loop
+            except Exception as e:
+                print(f"Async Sender: Unexpected error: {type(e).__name__}: {e}")
+                traceback.print_exc()
+                conn_active_flag.clear() # Signal main thread to stop on error
+                break # Exit loop
+        print("Async Gemini audio sender task finished.")
+
+
+    # --- Transcript Sender Task (Runs in Asyncio Loop) ---
+    async def send_transcript_to_frontend(sid, transcript_q: asyncio.Queue, active_flag: threading.Event):
+        """Reads from transcript queue and emits SocketIO events."""
+        print(f"Starting transcript sender for stream SID: {sid}")
+        while active_flag.is_set():
+            try:
+                text_chunk = await asyncio.wait_for(transcript_q.get(), timeout=0.5)
+                if text_chunk is None: # Sentinel value to stop
+                    break
+                # Use socketio.emit for thread safety
+                socketio.emit('call_transcript_update', {'stream_sid': sid, 'transcript_chunk': text_chunk})
+                transcript_q.task_done()
+            except asyncio.TimeoutError:
+                continue # Just check active_flag again
+            except asyncio.CancelledError:
+                print(f"Transcript sender {sid}: Task cancelled.")
                 break
             except Exception as e:
-                print(f"Unexpected error sending Gemini audio to Twilio: {type(e).__name__}: {e}")
+                print(f"Transcript sender {sid}: Error: {e}")
                 traceback.print_exc()
-                break # Exit on other errors
+                break # Exit on error
+        print(f"Transcript sender stopped for stream SID: {sid}")
 
-    # REMOVE async from definition
-    def receive_twilio_audio(loop_instance: AudioLoop, websocket, current_transcript_queue: asyncio.Queue, target_loop: asyncio.AbstractEventLoop):
-        """Receives audio from Twilio via WebSocket, converts it, and sends to Gemini."""
-        stream_sid = None # Store streamSid when received
-        transcript_sender_task = None # Task for sending transcript to frontend
 
-        # --- Task to send transcript updates to frontend ---
-        async def send_transcript_to_frontend(sid):
-            """Reads from transcript queue and emits SocketIO events."""
-            print(f"Starting transcript sender for stream SID: {sid}")
-            while True:
-                try:
-                    # Wait for a transcript chunk from Gemini (via AudioLoop)
-                    text_chunk = await asyncio.wait_for(current_transcript_queue.get(), timeout=0.5)
-                    if text_chunk is None: # Signal to stop
-                        break
-                    # Emit the transcript chunk to the frontend
-                    # Use socketio.emit for thread safety from async context
-                    socketio.emit('call_transcript_update', {'stream_sid': sid, 'transcript_chunk': text_chunk})
-                    current_transcript_queue.task_done()
-                except asyncio.TimeoutError:
-                    # Check if the main WebSocket is still alive
-                    if websocket.closed:
-                        print("Twilio WebSocket closed, stopping transcript sender.")
-                        break
-                    continue # No transcript chunk, continue waiting
-                except Exception as e:
-                    print(f"Error in send_transcript_to_frontend: {e}")
-                    traceback.print_exc()
-                    break # Exit on error
-            print(f"Transcript sender stopped for stream SID: {sid}")
-
-        while True:
+    # --- Background Thread Runner ---
+    def loop_runner(loop: asyncio.AbstractEventLoop, instance: AudioLoop, twilio_q: queue.Queue, conn_flag: threading.Event):
+        """Target function for the background thread managing the asyncio loop."""
+        asyncio.set_event_loop(loop)
+        try:
+            print(f"Starting assistant event loop {loop} in thread {threading.current_thread().name}")
+            # Run the async task manager
+            loop.run_until_complete(run_async_tasks(instance, twilio_q, conn_flag))
+        except Exception as e:
+            print(f"Error running async tasks in thread {threading.current_thread().name}: {e}")
+            traceback.print_exc()
+        finally:
+            print(f"Closing assistant event loop {loop} in thread {threading.current_thread().name}")
+            conn_flag.clear() # Ensure flag is cleared before closing loop
             try:
-                message_json = websocket.receive() # Removed await here
-                if message_json is None:
-                    print("WebSocket receive returned None. Connection likely closed.")
-                    break # Exit loop if connection closed
+                if not loop.is_running() and not loop.is_closed():
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception as shutdown_err:
+                print(f"Error during final shutdown_asyncgens in thread: {shutdown_err}")
+            if not loop.is_closed():
+                loop.close()
+            print(f"Assistant event loop {loop} closed.")
 
+
+    # --- Main WebSocket Connection Handling (Flask Thread) ---
+    assistant_loop = None
+    runner_thread = None
+    transcript_sender_future = None # To manage the transcript sender task future
+
+    try:
+        # 1. Instantiate the Assistant
+        print("Instantiating AudioLoop for WebSocket connection.")
+        assistant_instance = AudioLoop(audio_in_queue=audio_in_queue, out_queue=out_queue, transcript_queue=transcript_queue)
+
+        # 2. Create and start the background asyncio thread
+        assistant_loop = asyncio.new_event_loop()
+        runner_thread = threading.Thread(
+            target=loop_runner,
+            args=(assistant_loop, assistant_instance, twilio_send_queue, connection_active),
+            daemon=True,
+            name="AsyncioRunner"
+        )
+        runner_thread.start()
+        print("Background asyncio thread started.")
+
+        # Give the loop a moment to start
+        time.sleep(0.1)
+
+        # 3. Main loop in Flask thread for WebSocket I/O
+        stream_sid = None # Variable to store the actual stream SID
+        while connection_active.is_set():
+            try:
+                # --- Send outgoing messages ---
+                try:
+                    # Non-blocking check for messages from the async sender task
+                    outgoing_message_json = twilio_send_queue.get_nowait()
+                    print(f"Sync Sender: Retrieved message from queue. Attempting send...") # Log retrieval
+
+                    # --- Inject correct streamSid ---
+                    if stream_sid:
+                        try:
+                            # Parse, update, and re-serialize the message
+                            message_dict = json.loads(outgoing_message_json)
+                            if message_dict.get("event") == "media":
+                                message_dict["streamSid"] = stream_sid
+                                outgoing_message_to_send = json.dumps(message_dict)
+                                ws.send(outgoing_message_to_send) # Send synchronously
+                                print(f"Sync Sender: ws.send executed for message with SID {stream_sid}.") # Log send attempt
+                            else:
+                                # Should not happen if only media messages are queued, but handle defensively
+                                print(f"Sync Sender: Warning - Non-media message in queue: {outgoing_message_json}")
+                                ws.send(outgoing_message_json) # Send original if not media
+                        except json.JSONDecodeError:
+                             print(f"Sync Sender: Error decoding JSON from queue: {outgoing_message_json}")
+                             # Decide whether to send original or discard
+                             # ws.send(outgoing_message_json) # Option: Send original anyway
+                        except Exception as send_err:
+                             print(f"Sync Sender: Error during ws.send: {send_err}")
+                             connection_active.clear() # Stop on send error
+                             break
+                    else:
+                        # stream_sid not received yet, should not be sending media
+                        print(f"Sync Sender: Warning - Attempting to send message before stream_sid received: {outgoing_message_json}")
+                        # Optionally discard or queue for later? Discarding for now.
+
+                    twilio_send_queue.task_done()
+                except queue.Empty:
+                    pass # No message to send right now
+                except CONNECTION_CLOSED_EXCEPTIONS as e:
+                     print(f"Sync Sender: Connection closed during send: {type(e).__name__}")
+                     connection_active.clear() # Signal closure
+                     break
+                except Exception as e:
+                    print(f"Sync Sender: Error sending message: {e}")
+                    traceback.print_exc()
+                    connection_active.clear() # Signal closure on error
+                    break
+
+                # --- Receive incoming messages ---
+                # Use a timeout to avoid blocking forever, allowing send queue check
+                message_json = ws.receive(timeout=0.05) # Short timeout
+
+                if message_json is None:
+                    # Check connection status again if receive timed out or returned None ambiguously
+                    if not connection_active.is_set(): # Check if flag was cleared by background thread
+                         print("Sync Receiver: Connection flag cleared, exiting.")
+                         break
+                    continue # Timeout, loop again to check send queue and receive again
+
+                # --- Process incoming messages ---
                 message = json.loads(message_json)
                 event = message.get("event")
 
                 if event == "connected":
-                    print("Twilio Media Stream Connected")
+                    print("Sync Receiver: Twilio Media Stream Connected")
                 elif event == "start":
                     stream_sid = message.get("streamSid")
-                    print(f"Twilio Media Stream Started (SID: {stream_sid})")
-                    # Start the transcript sender task now that we have the stream_sid
-                    if stream_sid and not transcript_sender_task:
-                         # Run the async sender in the assistant's event loop
-                         if target_loop and target_loop.is_running(): # Use target_loop
-                              transcript_sender_task = asyncio.run_coroutine_threadsafe(
-                                   send_transcript_to_frontend(stream_sid),
-                                   target_loop # Use target_loop
-                              )
-                              print(f"Transcript sender task created for SID: {stream_sid}")
-                         else:
-                              print("Warning: Assistant loop not running, cannot start transcript sender.")
-
-                    # You might want to pass stream_sid to send_gemini_audio_to_twilio if needed
+                    print(f"Sync Receiver: Twilio Media Stream Started (SID: {stream_sid})")
+                    # Start the transcript sender task in the background asyncio loop
+                    if stream_sid and not transcript_sender_future and assistant_loop.is_running():
+                        print(f"Sync Receiver: Scheduling transcript sender for SID: {stream_sid}")
+                        transcript_sender_future = asyncio.run_coroutine_threadsafe(
+                            send_transcript_to_frontend(stream_sid, transcript_queue, connection_active),
+                            assistant_loop
+                        )
+                    # TODO: Update streamSid in the media message template? Difficult across threads.
                 elif event == "media":
                     payload = message.get("media", {}).get("payload")
-                    if payload:
-                        # 1. Decode base64 µ-law audio
+                    if payload and assistant_loop.is_running():
                         ulaw_data = decode_twilio_audio(payload)
-
-                        # 2. Convert 8kHz µ-law -> 8kHz PCM16
                         pcm8_data = ulaw_to_pcm(ulaw_data)
-
-                        # 3. Convert 8kHz PCM16 -> 16kHz PCM16 (for Gemini input)
                         pcm16_data = change_rate(pcm8_data, TWILIO_SAMPLE_RATE, GEMINI_INPUT_SAMPLE_RATE)
-
-                        # 4. Send to Gemini's input queue using run_coroutine_threadsafe
-                        if loop_instance and loop_instance.out_queue and target_loop and target_loop.is_running():
-                           # Use run_coroutine_threadsafe to put onto the async queue
-                           future = asyncio.run_coroutine_threadsafe(
-                               loop_instance.out_queue.put({"data": pcm16_data, "mime_type": "audio/pcm"}),
-                               target_loop # Use target_loop
-                           )
-                           # Optional: Wait for future result with timeout if needed, or just fire-and-forget
-                           # try:
-                           #     future.result(timeout=1.0)
-                           # except TimeoutError:
-                           #     print("Warning: Timeout putting audio onto Gemini queue.")
-                           # except Exception as put_err:
-                           #     print(f"Error putting audio onto Gemini queue: {put_err}")
-                        else:
-                           print("Warning: Cannot put audio to Gemini queue (instance, queue, or loop unavailable).")
-
-                # Correctly indented elif/else blocks start here (aligned with initial if/elif)
+                        # Put data onto the async queue for Gemini
+                        asyncio.run_coroutine_threadsafe(
+                            assistant_instance.out_queue.put({"data": pcm16_data, "mime_type": "audio/pcm"}),
+                            assistant_loop
+                        )
                 elif event == "stop":
-                    print("Twilio Media Stream Stopped")
-                    break # Exit loop when stream stops
+                    print("Sync Receiver: Twilio Media Stream Stopped")
+                    connection_active.clear() # Signal closure
+                    break
                 elif event == "error":
-                    print(f"Twilio Media Stream Error: {message.get('message')}")
-                    break # Exit on error
+                    print(f"Sync Receiver: Twilio Media Stream Error: {message.get('message')}")
+                    connection_active.clear() # Signal closure
+                    break
                 else:
-                    print(f"Received unknown WebSocket event: {event}")
+                    print(f"Sync Receiver: Received unknown WebSocket event: {event}")
 
-            # except ConnectionClosedOK: # flask-sock uses websockets library exception
-            #      print("WebSocket connection closed normally.")
-            #      break
+            except TimeoutError: # Catch specific timeout exception from ws.receive
+                 continue # Loop again after timeout
+            except CONNECTION_CLOSED_EXCEPTIONS as e:
+                 print(f"Sync Receiver: Connection closed during receive: {type(e).__name__}")
+                 connection_active.clear() # Signal closure
+                 break
             except Exception as e:
-                # Check for specific websocket closure exceptions if needed
-                if isinstance(e, ConnectionClosedOK):
-                     print("WebSocket connection closed normally by Twilio.")
-                else:
-                    print(f"Error processing WebSocket message: {e}")
-                    traceback.print_exc()
-                break # Exit on other errors
+                 print(f"Sync Receiver: Error processing WebSocket message: {e}")
+                 traceback.print_exc()
+                 connection_active.clear() # Signal closure on error
+                 break
 
-        print("Twilio audio receiver loop finished.")
-        # Signal transcript sender to stop if it's running
-        if current_transcript_queue and target_loop and target_loop.is_running():
-            # Use run_coroutine_threadsafe to put None onto the async queue
-            asyncio.run_coroutine_threadsafe(current_transcript_queue.put(None), target_loop)
-
-        if transcript_sender_task:
-            try:
-                # Wait briefly for the sender task future to finish
-                # Note: transcript_sender_task is a Future returned by run_coroutine_threadsafe
-                transcript_sender_task.result(timeout=2.0)
-                print("Transcript sender task finished.")
-            except TimeoutError: # Corrected exception name
-                print("Warning: Transcript sender task did not finish in time.")
-            except Exception as e:
-                print(f"Error waiting for transcript sender task: {e}")
-
-
-    # --- WebSocket Connection Lifecycle ---
-    assistant_loop = None # Define assistant_loop here
-    runner_thread = None # Define runner_thread here
-    try:
-        # 1. Instantiate the Assistant (passing the queues)
-        print("Instantiating AudioLoop for WebSocket connection.")
-        assistant_instance = AudioLoop(audio_in_queue=audio_in_queue, out_queue=out_queue, transcript_queue=transcript_queue)
-
-        # 2. Start the background task runner in a separate thread
-        assistant_loop = asyncio.new_event_loop()
-
-        # Define the target function for the thread, including loop closing
-        def loop_runner(loop: asyncio.AbstractEventLoop, instance: AudioLoop):
-            asyncio.set_event_loop(loop)
-            try:
-                print(f"Starting assistant event loop {loop} in thread {threading.current_thread().name}")
-                # Run the main tasks, assuming run_assistant_tasks handles its internal cleanup like shutdown_asyncgens
-                loop.run_until_complete(run_assistant_tasks(instance)) # Pass instance here
-            except Exception as e:
-                print(f"Error running assistant tasks in thread {threading.current_thread().name}: {e}")
-                traceback.print_exc() # Print traceback for errors in the thread
-            finally:
-                print(f"Closing assistant event loop {loop} in thread {threading.current_thread().name}")
-                # Ensure async generators are shut down if run_assistant_tasks didn't or errored out early
-                try:
-                    # Check if loop is stopped but not closed before shutting down generators
-                    if not loop.is_running() and not loop.is_closed():
-                         # Run shutdown within the loop context
-                         loop.run_until_complete(loop.shutdown_asyncgens())
-                except Exception as shutdown_err:
-                     print(f"Error during final shutdown_asyncgens in thread: {shutdown_err}")
-
-                if not loop.is_closed():
-                    loop.close()
-                print(f"Assistant event loop {loop} closed.")
-
-        # Pass the assistant_loop and assistant_instance to the target
-        runner_thread = threading.Thread(target=loop_runner, args=(assistant_loop, assistant_instance), daemon=True)
-        runner_thread.start()
-
-        # Wait briefly for the loop to start? Might not be necessary but safer.
-        import time
-        time.sleep(0.1) # Keep this small delay
-
-        # 3. Run the Twilio receiver loop directly (synchronously)
-        #    Pass the assistant_loop for threadsafe queue operations
-        if assistant_loop:
-             receive_twilio_audio(assistant_instance, ws, transcript_queue, assistant_loop)
-        else:
-             print("Error: Assistant loop not created, cannot start receiver.")
-
+        print("Sync WebSocket I/O loop finished.")
 
     except Exception as e:
-        print(f"Error during WebSocket handling: {e}")
+        print(f"Error during WebSocket handling setup: {e}")
         traceback.print_exc()
+        connection_active.clear() # Ensure flag is cleared on setup error
     finally:
-        print("WebSocket connection closing. Cleaning up...")
-        # Signal the assistant to stop
-        if assistant_instance:
-            print("Signalling assistant loop to stop...")
-            # Need to schedule stop() in the assistant's event loop
-            if assistant_loop and assistant_loop.is_running(): # Check if loop is running before scheduling
-                future = asyncio.run_coroutine_threadsafe(assistant_instance.stop(), assistant_loop) # Pass loop
-                try:
-                    # Optionally wait briefly for the stop signal to be processed
-                    future.result(timeout=1.0)
-                except TimeoutError:
-                    print("Warning: Timeout waiting for stop() signal future.")
-                except Exception as stop_err:
-                    print(f"Error scheduling/running stop(): {stop_err}")
-            elif assistant_loop and not assistant_loop.is_running():
-                 print("Warning: Assistant loop not running when trying to schedule stop(). Might have already stopped.")
-            else:
-                print("Warning: Assistant loop object not available, cannot schedule stop().")
+        print("WebSocket connection handler finishing. Cleaning up...")
+        connection_active.clear() # Explicitly clear flag
 
-        # Wait for the runner thread to finish (it should close the loop itself)
+        # Signal the assistant instance to stop (schedules stop in asyncio loop)
+        if assistant_instance and assistant_loop and assistant_loop.is_running():
+            print("Scheduling assistant stop...")
+            stop_future = asyncio.run_coroutine_threadsafe(assistant_instance.stop(), assistant_loop)
+            try:
+                stop_future.result(timeout=1.0) # Wait briefly for stop signal
+            except Exception as stop_err:
+                print(f"Error waiting for assistant stop future: {stop_err}")
+
+        # Signal transcript sender to stop (if running) by putting None
+        if transcript_queue:
+             # Use run_coroutine_threadsafe as queue is async, loop might still be running briefly
+             if assistant_loop and assistant_loop.is_running():
+                  asyncio.run_coroutine_threadsafe(transcript_queue.put(None), assistant_loop)
+             else: # If loop already stopped, just clear queue? Less clean.
+                  pass
+
+        # Wait for the background thread to finish its cleanup (including loop closing)
         if runner_thread and runner_thread.is_alive():
-             print("Waiting for assistant runner thread to join...")
-             runner_thread.join(timeout=5) # Give it time to clean up and close loop
+             print("Waiting for background asyncio thread to join...")
+             runner_thread.join(timeout=5)
              if runner_thread.is_alive():
-                 print("Warning: Assistant runner thread did not join.")
+                 print("Warning: Background asyncio thread did not join.")
              else:
-                 print("Assistant runner thread joined successfully.")
-
-        # REMOVED: assistant_loop.close() - The thread should handle this now.
-        # Check if loop is closed after join, just for logging
-        if assistant_loop and assistant_loop.is_closed():
-            print("Confirmed assistant loop is closed after thread join.")
-        elif assistant_loop:
-            print("Warning: Assistant loop is NOT closed after thread join.")
-
+                 print("Background asyncio thread joined successfully.")
 
         print("WebSocket cleanup complete.")
 
