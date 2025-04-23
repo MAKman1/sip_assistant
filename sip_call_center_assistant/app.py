@@ -139,7 +139,7 @@ def handle_incoming_call():
     response.append(connect)
 
     # Optional: Add a <Say> verb for debugging or initial greeting before stream connects
-    response.say("Connecting you to the assistant.")
+    # response.say("Connecting you to the assistant.")
 
     return str(response), 200, {'Content-Type': 'text/xml'}
 
