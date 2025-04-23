@@ -41,6 +41,7 @@ if sys.version_info < (3, 11, 0):
 # RECEIVE_SAMPLE_RATE = 24000 # Output rate from Gemini (set in app.py conversion)
 # CHUNK_SIZE = 1024
 
+# MODEL = "models/gemini-2.0-flash-live-001"
 MODEL = "models/gemini-2.0-flash-live-001"
 
 # --- System Instructions (Keep as is) ---
@@ -141,7 +142,13 @@ client = genai.Client(http_options={"api_version": "v1beta"})
 CONFIG = {
     "system_instruction": SYSTEM_INSTRUCTIONS,
     "tools": TOOLS,
-    "response_modalities": ["AUDIO"] # Keep audio response
+    "response_modalities": ["AUDIO"], # Keep audio response
+    "speech_config": types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Fenrir")
+        ),
+        language_code="en-GB"
+    )
 }
 
 # pya = pyaudio.PyAudio() # Removed

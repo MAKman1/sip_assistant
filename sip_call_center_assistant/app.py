@@ -58,7 +58,7 @@ CONNECTION_CLOSED_EXCEPTIONS = (WebSocketError, ConnectionClosed, ConnectionErro
 load_dotenv()
 
 # Check for environment variables AFTER loading .env
-required_env_vars = ['GOOGLE_API_KEY', 'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER']
+required_env_vars = ['GOOGLE_API_KEY', 'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER', 'PUBLIC_APP_HOST']
 missing_vars = [var for var in required_env_vars if not os.getenv(var)]
 if missing_vars:
     raise ValueError(f"Missing environment variables: {', '.join(missing_vars)}. Make sure they are in your .env file or environment.")
@@ -121,17 +121,25 @@ def handle_incoming_call():
     response = VoiceResponse()
     connect = Connect()
 
-    # IMPORTANT: Replace with your actual public WebSocket URL (e.g., from ngrok)
-    # TODO: Make this dynamically configurable instead of hardcoding
-    ngrok_domain = "3d1e-2a01-4b00-c014-9a00-d0ea-801a-aa66-f7f.ngrok-free.app" # Extract domain
-    websocket_url = f"wss://{ngrok_domain}/sip_stream"
+    # Construct WebSocket URL from environment variable
+    public_host = os.getenv('PUBLIC_APP_HOST')
+    if not public_host:
+        # This should ideally be caught by the check above, but double-check
+        print("FATAL ERROR: PUBLIC_APP_HOST environment variable not set.")
+        # Return an error TwiML or handle appropriately
+        response = VoiceResponse()
+        response.say("System configuration error. Please contact support.")
+        response.hangup()
+        return str(response), 500, {'Content-Type': 'text/xml'}
+
+    websocket_url = f"wss://{public_host}/sip_stream"
     print(f"Connecting to WebSocket: {websocket_url}")
 
     connect.stream(url=websocket_url)
     response.append(connect)
 
     # Optional: Add a <Say> verb for debugging or initial greeting before stream connects
-    # response.say("Connecting you to the assistant.")
+    response.say("Connecting you to the assistant.")
 
     return str(response), 200, {'Content-Type': 'text/xml'}
 
@@ -420,6 +428,21 @@ def sip_stream(ws):
                 elif event == "start":
                     stream_sid = message.get("streamSid")
                     print(f"Sync Receiver: Twilio Media Stream Started (SID: {stream_sid})")
+                    
+                    # --- START: Add initial text message sending ---
+                    initial_text_message = "Hey there" # Define the message
+                    if assistant_instance and assistant_loop and assistant_loop.is_running():
+                        print(f"Sync Receiver: Scheduling initial text message: '{initial_text_message}'")
+                        # Use run_coroutine_threadsafe to put the message onto the async queue
+                        asyncio.run_coroutine_threadsafe(
+                            assistant_instance.text_in_queue.put(initial_text_message),
+                            assistant_loop
+                        )
+                    else:
+                         print("Sync Receiver: Warning - Cannot send initial text, assistant/loop not ready.")
+                    # --- END: Add initial text message sending ---
+
+                    
                     # Start the transcript sender task in the background asyncio loop
                     if stream_sid and not transcript_sender_future and assistant_loop.is_running():
                         print(f"Sync Receiver: Scheduling transcript sender for SID: {stream_sid}")
@@ -573,11 +596,16 @@ def handle_initiate_call(data):
         print(f"--- [handle_initiate_call] Using Twilio Number: {twilio_phone_number}")
         # Construct the TwiML webhook URL dynamically using the same domain
         # Assumes Flask app is running on HTTP, not HTTPS locally
-        # TODO: Make ngrok domain dynamically configurable
-        ngrok_domain = "3d1e-2a01-4b00-c014-9a00-d0ea-801a-aa66-f7f.ngrok-free.app" # Extract domain
+        # Construct webhook URLs using the environment variable
+        public_host = os.getenv('PUBLIC_APP_HOST')
+        if not public_host:
+             print("--- [handle_initiate_call] FATAL ERROR: PUBLIC_APP_HOST not set for outbound call.")
+             socketio.emit('call_initiation_error', {'error': 'Server configuration error (Missing PUBLIC_APP_HOST)'}, room=request.sid)
+             return
+
         # IMPORTANT: Twilio needs an HTTP/HTTPS URL for the call webhook, not WSS
-        twiml_webhook_url = f"https://{ngrok_domain}/incoming_call" # Use HTTPS for ngrok
-        status_callback_url = f"https://{ngrok_domain}/call_status"
+        twiml_webhook_url = f"https://{public_host}/incoming_call" # Use HTTPS
+        status_callback_url = f"https://{public_host}/call_status"
 
         print(f"--- [handle_initiate_call] Using TwiML URL: {twiml_webhook_url}")
         print(f"--- [handle_initiate_call] Using Status Callback URL: {status_callback_url}")

@@ -2,7 +2,7 @@ Flask
 Flask-SocketIO
 Flask-CORS
 flask-sock # Keep for Twilio media stream for now, might refactor later
-google-genai
+google-genai==1.11.0
 python-dotenv
 twilio
 # opencv-python # Removed - No longer needed for video

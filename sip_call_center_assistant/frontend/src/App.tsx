@@ -21,8 +21,10 @@ interface CallStatusUpdate {
   status: string; // e.g., 'ringing', 'in-progress', 'completed', 'failed'
 }
 
-// Define the backend URL (adjust if your Flask app runs elsewhere)
-const SOCKET_URL = 'http://localhost:8081';
+// Get the backend URL from environment variables (Vite specific)
+// Fallback to localhost if not set during development/build
+const SOCKET_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8081';
+console.log(`Connecting to backend at: ${SOCKET_URL}`); // Log the URL being used
 
 function App() {
   const [isConnected, setIsConnected] = useState(false);
