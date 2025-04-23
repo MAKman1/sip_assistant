@@ -76,7 +76,7 @@ AUDIO_WIDTH = 2 # Bytes per sample for PCM16
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}}) # Allow CORS for frontend dev server
 sock = Sock(app) # Initialize flask-sock for Twilio Media Stream
-socketio = SocketIO(app, async_mode='threading', cors_allowed_origins="http://localhost:5173") # Initialize SocketIO for Frontend
+socketio = SocketIO(app, async_mode='threading', cors_allowed_origins=["http://localhost:5173", "https://caller-frontend-959273450812.europe-west2.run.app"]) # Initialize SocketIO for Frontend
 
 # Global state (consider managing per-connection state differently for WebSockets)
 # assistant_instance: AudioLoop | None = None
